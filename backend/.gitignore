@@ -1,6 +1,10 @@
 # dependencies
 /node_modules
 
+# TypeScript
+/dist
+*.tsbuildinfo
+
 # environment variables
 .env
 .env.local
@@ -26,3 +30,5 @@ playwright-report/
 .vercel
 
 dev.sqlite3
+.env*.local
+.env.production

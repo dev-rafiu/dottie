@@ -1,0 +1,458 @@
+name: Reusable Deployment Workflow
+
+on:
+  workflow_call:
+    inputs:
+      deployment_type:
+        description: 'Type of deployment (main or branch)'
+        required: true
+        type: string
+      branch_name:
+        description: 'Branch name for branch deployments'
+        required: false
+        type: string
+      pr_number:
+        description: 'PR number for branch deployments'
+        required: false
+        type: string
+      environment:
+        description: 'GitHub Environment for deployment protection (optional)'
+        required: false
+        type: string
+    outputs:
+      api_url:
+        description: "API deployment URL"
+        value: ${{ jobs.deploy-api.outputs.deployment_url }}
+      web_url:
+        description: "Web deployment URL"
+        value: ${{ jobs.deploy-web.outputs.deployment_url }}
+
+jobs:
+  deploy-api:
+    runs-on: ubuntu-latest
+    # Apply environment protection if specified (for preview deployments)
+    environment: ${{ inputs.environment }}
+    outputs:
+      deployment_url: ${{ steps.deploy.outputs.deployment_url }}
+
+    steps:
+      - name: 🛒 Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 📋 Load Project Configuration
+        id: config
+        uses: ./.github/workflows/actions/load-config
+
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18.x'
+
+      - name: 📥 Install API Dependencies
+        run: |
+          cd backend
+          npm ci
+
+      - name: 🔧 Build API
+        run: |
+          cd backend
+          npm run build || echo "No build step configured"
+
+      - name: 🗄️ Initialize Database Schema
+        run: |
+          cd backend
+          npm run db:init
+        env:
+          NODE_ENV: production
+          NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+
+      - name: 🧪 Run API Tests
+        run: |
+          cd backend
+          npm test
+        # Tests use SQLite with isolated database (not Neon production DB)
+
+      - name: 🔐 Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: 🛠️ Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ steps.config.outputs.gcp-project-id }}
+
+      - name: 🔍 Validate GCP Authentication & Permissions
+        run: |
+          echo "=== 🔐 VALIDATING GCP AUTHENTICATION ==="
+
+          # Test basic authentication
+          echo "🧪 Testing basic gcloud auth..."
+          if gcloud auth list --filter=status:ACTIVE --format="value(account)"; then
+            echo "✅ Successfully authenticated to GCP"
+          else
+            echo "❌ GCP authentication failed"
+            exit 1
+          fi
+
+          # Verify project access
+          echo "🏗️ Testing project access..."
+          PROJECT_ID=$(gcloud config get-value project)
+          echo "📋 Current project: $PROJECT_ID"
+
+          if [ "$PROJECT_ID" != "${{ steps.config.outputs.gcp-project-id }}" ]; then
+            echo "❌ Project mismatch! Expected: ${{ steps.config.outputs.gcp-project-id }}, Got: $PROJECT_ID"
+            exit 1
+          fi
+
+          # Test service account details
+          echo "👤 Service account details:"
+          gcloud auth list --filter=status:ACTIVE --format="table(account,status)"
+
+          echo "=== 📦 VALIDATING ARTIFACT REGISTRY ==="
+
+          # Check if Artifact Registry API is enabled
+          echo "🔌 Checking Artifact Registry API..."
+          if gcloud services list --enabled --filter="name:artifactregistry.googleapis.com" --format="value(name)"; then
+            echo "✅ Artifact Registry API is enabled"
+          else
+            echo "❌ Artifact Registry API is not enabled"
+            exit 1
+          fi
+
+          # Check if repository exists
+          echo "📦 Checking ${{ steps.config.outputs.artifact-registry-repository }} repository..."
+          if gcloud artifacts repositories describe ${{ steps.config.outputs.artifact-registry-repository }} --location=${{ steps.config.outputs.artifact-registry-location }} --format="value(name)"; then
+            echo "✅ ${{ steps.config.outputs.artifact-registry-repository }} repository exists"
+          else
+            echo "❌ ${{ steps.config.outputs.artifact-registry-repository }} repository does not exist"
+            echo "🔧 Creating repository..."
+            gcloud artifacts repositories create ${{ steps.config.outputs.artifact-registry-repository }} \
+              --repository-format=docker \
+              --location=${{ steps.config.outputs.artifact-registry-location }} \
+              --description="API Docker images for deployments"
+          fi
+
+          # Test Docker authentication
+          echo "🐳 Testing Docker authentication..."
+          if gcloud auth configure-docker ${{ steps.config.outputs.artifact-registry-location }}-docker.pkg.dev --quiet; then
+            echo "✅ Docker authentication configured"
+          else
+            echo "❌ Docker authentication failed"
+            exit 1
+          fi
+
+          echo "=== ✅ ALL VALIDATIONS PASSED ==="
+
+      - name: 🐳 Configure Docker for Artifact Registry
+        run: |
+          gcloud auth configure-docker ${{ steps.config.outputs.artifact-registry-location }}-docker.pkg.dev
+
+      - name: 🏗️ Build and Push Docker Image
+        run: |
+          # Determine service name based on deployment type
+          if [ "${{ inputs.deployment_type }}" = "main" ]; then
+            SERVICE_NAME="${{ steps.config.outputs.app-name }}-api-main"
+          else
+            # Clean branch name for use in service names (remove special characters)
+            CLEAN_BRANCH=$(echo "${{ inputs.branch_name }}" | sed 's/[^a-zA-Z0-9-]/-/g' | tr '[:upper:]' '[:lower:]' | sed 's/--*/-/g' | sed 's/^-\|-$//g')
+            SERVICE_NAME="api-${CLEAN_BRANCH}"
+          fi
+
+          IMAGE_NAME="${{ steps.config.outputs.artifact-registry-location }}-docker.pkg.dev/${{ steps.config.outputs.gcp-project-id }}/${{ steps.config.outputs.artifact-registry-repository }}/${SERVICE_NAME}:${{ github.sha }}"
+
+          echo "🏷️ Building image: $IMAGE_NAME"
+          echo "🔖 Service name: $SERVICE_NAME"
+
+          # Build and push the image from repository root with correct context
+          docker build -t $IMAGE_NAME -f backend/Dockerfile .
+          docker push $IMAGE_NAME
+
+          # Store values for next step
+          echo "IMAGE_NAME=$IMAGE_NAME" >> $GITHUB_ENV
+          echo "SERVICE_NAME=$SERVICE_NAME" >> $GITHUB_ENV
+
+      - name: 🚀 Deploy to Cloud Run
+        id: deploy
+        run: |
+          echo "🚀 Deploying ${{ inputs.deployment_type }} service: $SERVICE_NAME"
+
+          # For branch deployments, clean up existing service to ensure predictable URLs
+          if [ "${{ inputs.deployment_type }}" = "branch" ]; then
+            if gcloud run services describe $SERVICE_NAME --region=${{ steps.config.outputs.cloud-run-region }} --quiet > /dev/null 2>&1; then
+              echo "📍 Found existing service, deleting..."
+              gcloud run services delete $SERVICE_NAME --region=${{ steps.config.outputs.cloud-run-region }} --quiet
+
+              # Wait for deletion to complete
+              echo "⏳ Waiting for service deletion to complete..."
+              while gcloud run services describe $SERVICE_NAME --region=${{ steps.config.outputs.cloud-run-region }} --quiet > /dev/null 2>&1; do
+                echo "   Still deleting..."
+                sleep 5
+              done
+              echo "✅ Service deletion completed"
+            fi
+          fi
+
+          # Deploy the service with environment variables
+          # Note: CORS is handled by fallback Firebase patterns in server.js
+          # TODO: Implement proper CORS_ORIGINS env var handling (JSON array escaping issue)
+          gcloud run deploy $SERVICE_NAME \
+            --image $IMAGE_NAME \
+            --platform managed \
+            --region ${{ steps.config.outputs.cloud-run-region }} \
+            --allow-unauthenticated \
+            --memory=${{ steps.config.outputs.cloud-run-memory }} \
+            --cpu=${{ steps.config.outputs.cloud-run-cpu }} \
+            --min-instances=${{ steps.config.outputs.cloud-run-min-instances }} \
+            --max-instances=${{ steps.config.outputs.cloud-run-max-instances }} \
+            --timeout=${{ steps.config.outputs.cloud-run-timeout }} \
+            --concurrency=${{ steps.config.outputs.cloud-run-concurrency }} \
+            --set-env-vars="NODE_ENV=production,JWT_SECRET=${{ secrets.JWT_SECRET }},REFRESH_SECRET=${{ secrets.REFRESH_SECRET }},GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }},NEON_DATABASE_URL=${{ secrets.NEON_DATABASE_URL }}"
+
+          # Get the service URL
+          SERVICE_URL=$(gcloud run services describe $SERVICE_NAME --platform managed --region ${{ steps.config.outputs.cloud-run-region }} --format 'value(status.url)')
+
+          echo "🌐 Service deployed at: $SERVICE_URL"
+          echo "deployment_url=$SERVICE_URL" >> $GITHUB_OUTPUT
+
+      - name: ✅ Validate API Deployment
+        run: |
+          API_URL="${{ steps.deploy.outputs.deployment_url }}"
+          echo "🔍 Testing API at: $API_URL"
+
+          # Test health endpoint with retry
+          for i in {1..5}; do
+            echo "🏥 Health check attempt $i/5..."
+
+            # Get health response
+            HEALTH_RESPONSE=$(curl -s -f "$API_URL${{ steps.config.outputs.api-health-endpoint }}" -m 15)
+            CURL_EXIT_CODE=$?
+
+            if [ $CURL_EXIT_CODE -eq 0 ]; then
+              echo "✅ API responded successfully!"
+              echo "📄 Health Response: $HEALTH_RESPONSE"
+              break
+            else
+              echo "❌ API health endpoint failed (HTTP error)"
+
+              if [ $i -eq 5 ]; then
+                echo "❌ API health check failed after 5 attempts"
+                exit 1
+              fi
+            fi
+
+            echo "⏳ Waiting 10 seconds before retry..."
+            sleep 10
+          done
+
+          # Test CORS
+          echo "🌐 Testing CORS configuration..."
+          CORS_RESPONSE=$(curl -s -X OPTIONS "$API_URL${{ steps.config.outputs.api-health-endpoint }}" \
+            -H "Origin: ${{ steps.config.outputs.firebase-main-url }}" \
+            -H "Access-Control-Request-Method: GET" \
+            -H "Access-Control-Request-Headers: Content-Type" \
+            -w "%{http_code}" -o /dev/null)
+
+          if [ "$CORS_RESPONSE" = "200" ]; then
+            echo "✅ CORS configuration is working correctly!"
+          else
+            echo "⚠️ CORS preflight returned status: $CORS_RESPONSE"
+          fi
+
+      - name: 📊 API Deployment Summary
+        run: |
+          echo "🎯 API Deployment Complete!"
+          echo "📍 URL: ${{ steps.deploy.outputs.deployment_url }}"
+          echo "🏷️ Service: $SERVICE_NAME"
+          echo "🔄 Type: ${{ inputs.deployment_type }}"
+          echo "✅ Health check passed"
+
+  deploy-web:
+    needs: deploy-api
+    runs-on: ubuntu-latest
+    # Apply environment protection if specified (for preview deployments)
+    environment: ${{ inputs.environment }}
+    outputs:
+      deployment_url: ${{ steps.set_url.outputs.deployment_url }}
+
+    steps:
+      - name: 🛒 Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 📋 Load Project Configuration
+        id: config
+        uses: ./.github/workflows/actions/load-config
+
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: ${{ steps.config.outputs.web-entry-point }}/package-lock.json
+
+      - name: 📥 Install Web Dependencies
+        run: |
+          cd ${{ steps.config.outputs.web-entry-point }}
+          npm ci
+
+      - name: 🔧 Configure API Integration
+        run: |
+          API_URL="${{ needs.deploy-api.outputs.deployment_url }}"
+          echo "🔗 API URL: $API_URL"
+
+          if [[ ! "$API_URL" =~ ^https?:// ]]; then
+            echo "❌ Invalid API URL format"
+            exit 1
+          fi
+
+          cd ${{ steps.config.outputs.web-entry-point }}
+
+          # Create Vite environment file for production build
+          echo "${{ steps.config.outputs.web-environment-prefix }}API_BASE_URL=$API_URL" > .env.production
+          echo "📝 Created .env.production with API URL: $API_URL"
+
+          # Also update the local .env file if it exists (for consistency)
+          if [ -f .env ]; then
+            sed -i "s|${{ steps.config.outputs.web-environment-prefix }}API_BASE_URL=.*|${{ steps.config.outputs.web-environment-prefix }}API_BASE_URL=$API_URL|g" .env || true
+          fi
+
+          echo "✅ API integration configured"
+
+      - name: 🏗️ Build Web App
+        run: |
+          cd ${{ steps.config.outputs.web-entry-point }}
+          ${{ steps.config.outputs.web-build-command }}
+        env:
+          NODE_ENV: production
+
+      - name: 🧪 Run Web Tests
+        run: |
+          cd ${{ steps.config.outputs.web-entry-point }}
+          echo "🧪 Running web tests against built artifacts..."
+          ${{ steps.config.outputs.web-test-command }}
+
+      - name: 🔐 Deploy to Firebase
+        uses: FirebaseExtended/action-hosting-deploy@v0
+        with:
+          repoToken: ${{ secrets.GITHUB_TOKEN }}
+          firebaseServiceAccount: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_KEY }}
+          projectId: ${{ steps.config.outputs.firebase-project-id }}
+          channelId: ${{ inputs.deployment_type == 'main' && 'live' || format('branch-{0}', inputs.pr_number) }}
+          entryPoint: '.'  # firebase.json is in repository root
+        id: deploy
+
+      - name: 🔗 Set Deployment URL
+        id: set_url
+        run: |
+          if [ "${{ inputs.deployment_type }}" = "main" ]; then
+            # Try Firebase action outputs first
+            DETAILS_URL="${{ steps.deploy.outputs.details_url }}"
+            URLS_OUTPUT="${{ steps.deploy.outputs.urls }}"
+
+            if [[ -n "$DETAILS_URL" && "$DETAILS_URL" != "null" ]]; then
+              DEPLOYMENT_URL="$DETAILS_URL"
+              echo "✅ Using details_url from Firebase action: $DEPLOYMENT_URL"
+            elif [[ -n "$URLS_OUTPUT" && "$URLS_OUTPUT" != "null" ]]; then
+              DEPLOYMENT_URL=$(echo "$URLS_OUTPUT" | head -n1 | sed 's/,.*$//')
+              echo "✅ Using first URL from Firebase action: $DEPLOYMENT_URL"
+            else
+              # Fallback to predictable Firebase main URL
+              DEPLOYMENT_URL="${{ steps.config.outputs.firebase-main-url }}"
+              echo "⚠️ Firebase action outputs empty, using fallback URL: $DEPLOYMENT_URL"
+            fi
+          else
+            # Branch deployment
+            DEPLOYMENT_URL="${{ steps.deploy.outputs.details_url }}"
+            echo "✅ Branch deployment URL: $DEPLOYMENT_URL"
+          fi
+
+          echo "deployment_url=$DEPLOYMENT_URL" >> $GITHUB_OUTPUT
+
+      - name: ✅ Validate Web Deployment
+        run: |
+          WEB_URL="${{ steps.set_url.outputs.deployment_url }}"
+          echo "🔍 Testing web app at: $WEB_URL"
+
+          # Test if web app is accessible
+          for i in {1..3}; do
+            echo "📱 Web accessibility test $i/3..."
+            if curl -f "$WEB_URL" -m 15 >/dev/null 2>&1; then
+              echo "✅ Web app is accessible!"
+              break
+            fi
+
+            if [ $i -eq 3 ]; then
+              echo "❌ Web accessibility test failed"
+              exit 1
+            fi
+
+            echo "⏳ Waiting 10 seconds before retry..."
+            sleep 10
+          done
+
+      - name: 📊 Web Deployment Summary
+        run: |
+          echo "🌟 Web Deployment Complete!"
+          echo "📍 URL: ${{ steps.set_url.outputs.deployment_url }}"
+          echo "🔌 API Connected: ${{ needs.deploy-api.outputs.deployment_url }}"
+          echo "🔄 Type: ${{ inputs.deployment_type }}"
+          echo "✅ Ready for testing"
+
+  update-pr-comment:
+    needs: [deploy-api, deploy-web]
+    if: inputs.deployment_type == 'branch'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 💬 Update PR with Deployment Status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const webUrl = '${{ needs.deploy-web.outputs.deployment_url }}';
+            const apiUrl = '${{ needs.deploy-api.outputs.deployment_url }}';
+
+            const commentBody = `## 🚀 BRANCH DEPLOYMENT
+
+            ### 🌐 Web App
+            **Live Preview:** [${webUrl}](${webUrl})
+
+            ### ⚡ API Service
+            **API Endpoint:** [${apiUrl}](${apiUrl})
+
+            ### 🧪 Quick Test Links
+            - [📱 Web App](${webUrl}) - Test the user interface
+            - [❤️ API Health](${apiUrl}/health) - Verify API status
+            - [🔗 Click here to test!](${webUrl})
+
+            ✅ Deployments successful! Integration tests will run next.
+
+            ---
+            *🔄 Last updated: ${new Date().toLocaleString()} UTC*
+
+            <!-- BRANCH_DEPLOYMENT_COMMENT -->`;
+
+            const comments = await github.rest.issues.listComments({
+              issue_number: ${{ inputs.pr_number }},
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+
+            const existingComment = comments.data.find(comment =>
+              comment.body.includes('<!-- BRANCH_DEPLOYMENT_COMMENT -->')
+            );
+
+            if (existingComment) {
+              await github.rest.issues.updateComment({
+                comment_id: existingComment.id,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: commentBody
+              });
+            } else {
+              await github.rest.issues.createComment({
+                issue_number: ${{ inputs.pr_number }},
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: commentBody
+              });
+            }

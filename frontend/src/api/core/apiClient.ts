@@ -1,45 +1,23 @@
 import axios from 'axios';
-import { getAuthToken, setAuthToken, setRefreshToken, TOKEN_KEYS } from './tokenManager';
+import { getAuthToken, setAuthToken, setRefreshToken } from './tokenManager';
+import { getBaseUrl, setApiBaseUrl, logBaseUrlConfig } from './getBaseUrl';
+import { setupRequestInterceptor, setupResponseInterceptor } from './interceptors';
 
 /**
- * Axios instance for making API requests
+ * Main axios instance for making API requests
  * This instance has all the common configurations and interceptors
  */
-// Determine API base URL with fallbacks
-const getBaseUrl = () => {
-  // First priority: Use environment variable if available
-  if (import.meta.env.VITE_API_BASE_URL) {
-    return import.meta.env.VITE_API_BASE_URL;
-  }
-  
-  // Second priority: Check for manually configured API URL in localStorage
-  const savedApiUrl = localStorage.getItem('api_base_url');
-  if (savedApiUrl) {
-    return savedApiUrl;
-  }
-  
-  // Default fallback for local development
-  if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
-    return `http://${window.location.hostname}:5000`;
-  }
-  
-  // Production fallback: assume API is at the same origin
-  return window.location.origin;
-};
 
-// Expose a function to update the API URL at runtime
-export const setApiBaseUrl = (url: string) => {
-  localStorage.setItem('api_base_url', url);
-  apiClient.defaults.baseURL = url;
-  console.log(`[API Client] Base URL updated to: ${url}`);
-  return url;
-};
+// Get and log the base URL
+const baseUrl = getBaseUrl();
+logBaseUrlConfig(baseUrl);
 
+// Create the axios instance
 const apiClient = axios.create({
-  baseURL: getBaseUrl(),
+  baseURL: baseUrl,
   headers: {
-    'Content-Type': 'application/json',
-  },
+    'Content-Type': 'application/json'
+  }
 });
 
 // Initialize headers from localStorage if available
@@ -47,64 +25,20 @@ try {
   const token = getAuthToken();
   if (token) {
     apiClient.defaults.headers.common['Authorization'] = `Bearer ${token}`;
-    console.log('[API Client] Initialized with token from localStorage');
-  } else {
-    console.log('[API Client] No token found in localStorage during initialization');
   }
 } catch (error) {
   console.error('[API Client] Error accessing localStorage:', error);
 }
 
-// Add a request interceptor to always try to include the latest token
-apiClient.interceptors.request.use(
-  (config) => {
-    try {
-      // Get token using our token manager
-      const token = getAuthToken();
-      
-      if (token) {
-        config.headers.Authorization = `Bearer ${token}`;
-      }
-    } catch (error) {
-      console.error('[API Client] Error in request interceptor:', error);
-    }
-    return config;
-  },
-  (error) => {
-    return Promise.reject(error);
-  }
-);
+// Setup interceptors
+setupRequestInterceptor(apiClient);
+setupResponseInterceptor(apiClient);
 
-// Add response interceptor for common error handling
-apiClient.interceptors.response.use(
-  (response) => response,
-  (error) => {
-    // Handle common errors here
-    if (error.response) {
-      // Server responded with an error status
-      console.error(`API Error: ${error.response.status}`, error.response.data);
-      
-      // Handle 401 Unauthorized - redirect to login
-      if (error.response.status === 401) {
-        // Remove token and redirect to login
-        localStorage.removeItem('authToken');
-        // Redirect logic would go here for a real app
-      }
-    } else if (error.request) {
-      // Request was made but no response received (network error)
-      console.error('Network Error:', error.request);
-    } else {
-      // Something else went wrong
-      console.error('Error:', error.message);
-    }
-    
-    return Promise.reject(error);
-  }
-);
+// Update the setApiBaseUrl function to also update the client
+const updateApiBaseUrl = (url: string) => {
+  const newUrl = setApiBaseUrl(url);
+  apiClient.defaults.baseURL = newUrl;
+  return newUrl;
+};
 
-// Helper functions to check response status
-export const isSuccess = (status: number): boolean => status >= 200 && status < 300;
-export const isClientError = (status: number): boolean => status >= 400 && status < 500;
-export const isServerError = (status: number): boolean => status >= 500;
-
-export { apiClient, setAuthToken, setRefreshToken }; 
+export { apiClient, setAuthToken, setRefreshToken, updateApiBaseUrl as setApiBaseUrl };

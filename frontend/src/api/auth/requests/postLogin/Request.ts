@@ -1,6 +1,5 @@
-import { apiClient } from "../../../core/apiClient";
-import { LoginInput, AuthResponse } from "../../types";
-import { storeAuthData } from "../../../core/tokenManager";
+import { apiClient, setAuthToken, setRefreshToken } from '../../../core/apiClient';
+import { LoginInput, AuthResponse } from '../../types';
 
 /**
  * Login user with credentials
@@ -8,27 +7,17 @@ import { storeAuthData } from "../../../core/tokenManager";
  */
 export const postLogin = async (credentials: LoginInput): Promise<AuthResponse> => {
   try {
-    console.log('[Login Debug] Making login request with:', {
-      email: credentials.email,
-      hasPassword: !!credentials.password
-    });
-    
     const response = await apiClient.post('/api/auth/login', credentials);
-    
-    // Log entire response for debugging
-    console.log('[Login Debug] FULL login response:', response);
-    
-    // Use the centralized token manager to handle token storage
-    const success = storeAuthData(response.data);
-    
-    console.log('[Login Debug] Token storage result:', {
-      success,
-      responseDataKeys: Object.keys(response.data || {}),
-      hasUserObject: !!response.data?.user,
-      hasToken: !!response.data?.token,
-      hasRefreshToken: !!response.data?.refreshToken
-    });
-    
+
+    // Store auth tokens
+    if (response.data.token) {
+      setAuthToken(response.data.token);
+    }
+
+    if (response.data.refreshToken) {
+      setRefreshToken(response.data.refreshToken);
+    }
+
     return response.data;
   } catch (error) {
     console.error('Login failed:', error);
@@ -36,4 +25,4 @@ export const postLogin = async (credentials: LoginInput): Promise<AuthResponse> 
   }
 };
 
-export default postLogin; 
+export default postLogin;

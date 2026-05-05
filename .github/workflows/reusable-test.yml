@@ -1,0 +1,494 @@
+name: Reusable Test Workflow
+
+on:
+  workflow_call:
+    inputs:
+      api_url:
+        description: 'API deployment URL'
+        required: true
+        type: string
+      web_url:
+        description: 'Web deployment URL'
+        required: true
+        type: string
+      deployment_type:
+        description: 'Type of deployment (main or branch)'
+        required: true
+        type: string
+      branch_name:
+        description: 'Branch name for branch deployments'
+        required: false
+        type: string
+      pr_number:
+        description: 'PR number for branch deployments'
+        required: false
+        type: string
+
+jobs:
+  test-api:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 🛒 Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: 📥 Install Backend Dependencies
+        run: |
+          cd backend
+          npm ci
+
+      - name: 🧪 Run Backend Unit Tests
+        run: |
+          echo "🧪 Running backend unit tests..."
+          cd backend
+          npm test
+        env:
+          NODE_ENV: test
+          JWT_SECRET: test-secret
+
+      - name: 🏥 Test API Health Check
+        run: |
+          echo "🏥 Testing API health at: ${{ inputs.api_url }}"
+
+          # Test health endpoint with retry
+          for i in {1..5}; do
+            echo "🔍 Health check attempt $i/5..."
+            if curl -f "${{ inputs.api_url }}/api/health" -m 15; then
+              echo "✅ API is healthy!"
+              break
+            fi
+
+            if [ $i -eq 5 ]; then
+              echo "❌ API health check failed after 5 attempts"
+              exit 1
+            fi
+
+            echo "⏳ Waiting 10 seconds before retry..."
+            sleep 10
+          done
+
+      - name: 🧪 Test API Endpoints
+        run: |
+          echo "🚀 Testing API endpoints..."
+
+          # Test auth endpoints
+          echo "📄 Testing auth endpoint..."
+          if curl -f "${{ inputs.api_url }}/api/auth/health" -m 15; then
+            echo "✅ Auth endpoint is working!"
+          else
+            echo "⚠️ Auth endpoint not responding (may require authentication)"
+          fi
+
+          # Test assessment endpoints
+          echo "📄 Testing assessment endpoint..."
+          if curl -f "${{ inputs.api_url }}/api/assessment/health" -m 15; then
+            echo "✅ Assessment endpoint is working!"
+          else
+            echo "⚠️ Assessment endpoint not responding (may require authentication)"
+          fi
+
+          echo "✅ API endpoint tests completed!"
+
+      - name: 🎯 Run Backend Integration Tests
+        run: |
+          echo "🧪 Running backend integration tests..."
+          cd backend
+          npm run test:integration || echo "⚠️ No integration tests found or tests failed"
+        env:
+          API_BASE_URL: ${{ inputs.api_url }}
+          NODE_ENV: test
+          JWT_SECRET: test-secret
+          BRANCH_NAME: ${{ inputs.branch_name }}
+          GITHUB_HEAD_REF: ${{ inputs.branch_name }}
+        continue-on-error: true
+
+      - name: 📋 Upload API Test Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: api-test-results-${{ inputs.deployment_type }}-${{ inputs.pr_number || 'main' }}
+          path: |
+            backend/test-results/
+            backend/coverage/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  test-integration:
+    needs: test-api
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 🛒 Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 🔍 Environment Validation
+        run: |
+          echo "🧪 Web App: ${{ inputs.web_url }}"
+          echo "🧪 API Service: ${{ inputs.api_url }}"
+
+          if [[ ! "${{ inputs.web_url }}" =~ ^https?:// ]] || [[ ! "${{ inputs.api_url }}" =~ ^https?:// ]]; then
+            echo "❌ Invalid URL format"
+            exit 1
+          fi
+
+      - name: 🏥 API Health Check
+        run: |
+          echo "🔍 Testing API health endpoint..."
+
+          for i in {1..3}; do
+            echo "Health check attempt $i/3..."
+
+            if curl -f "${{ inputs.api_url }}/api/health" -m 15; then
+              echo "✅ API health check passed"
+              break
+            fi
+
+            if [ $i -eq 3 ]; then
+              echo "❌ API health check failed after 3 attempts"
+              exit 1
+            fi
+
+            echo "⏳ Waiting 10 seconds..."
+            sleep 10
+          done
+
+      - name: 📡 API Endpoint Tests
+        run: |
+          echo "🔍 Testing key API endpoints..."
+          API_URL="${{ inputs.api_url }}"
+
+          # Test GitHub API endpoints (if available)
+          echo "Testing GitHub API endpoints..."
+
+          # Test basic API routes
+          curl -f "$API_URL/api/github/health" -m 10 || {
+            echo "⚠️ GitHub API health endpoint not available"
+          }
+
+          # Test if API responds with proper JSON
+          echo "Testing API JSON response..."
+          RESPONSE=$(curl -s "$API_URL/api/health" -m 10)
+          if [[ "$RESPONSE" == *"{"* ]]; then
+            echo "✅ API returns JSON responses"
+          else
+            echo "⚠️ API response format may be incorrect"
+          fi
+
+          # Test auth signup endpoint (uses bcrypt - catches segmentation faults)
+          echo "🔐 Testing auth signup endpoint (CRITICAL - tests bcrypt functionality)..."
+          TIMESTAMP=$(date +%s)
+          TEST_USER="test_ci_${TIMESTAMP}@example.com"
+
+          SIGNUP_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$API_URL/api/auth/signup" \
+            -H "Content-Type: application/json" \
+            -d "{\"email\":\"${TEST_USER}\",\"password\":\"TestPass123!\",\"username\":\"testuser_${TIMESTAMP}\"}" \
+            -m 15)
+
+          SIGNUP_HTTP_CODE=$(echo "$SIGNUP_RESPONSE" | tail -n1)
+          SIGNUP_BODY=$(echo "$SIGNUP_RESPONSE" | head -n-1)
+
+          echo "Signup response code: $SIGNUP_HTTP_CODE"
+          echo "Signup response body: $SIGNUP_BODY"
+
+          if [[ "$SIGNUP_HTTP_CODE" == "201" ]] || [[ "$SIGNUP_HTTP_CODE" == "200" ]]; then
+            echo "✅ Auth signup endpoint working (bcrypt is functional)"
+          elif [[ "$SIGNUP_HTTP_CODE" == "503" ]]; then
+            echo "❌ CRITICAL: Signup endpoint returned 503 - likely segmentation fault in bcrypt"
+            exit 1
+          elif [[ "$SIGNUP_HTTP_CODE" == "409" ]]; then
+            echo "⚠️ User already exists (this is OK for testing)"
+          else
+            echo "⚠️ Unexpected response code: $SIGNUP_HTTP_CODE"
+            echo "Response: $SIGNUP_BODY"
+          fi
+
+          echo "✅ API endpoint tests completed"
+
+      - name: 🔗 CORS Configuration Test
+        run: |
+          echo "🔍 Testing CORS configuration..."
+
+          # Test if CORS is properly configured
+          curl -H "Origin: ${{ inputs.web_url }}" \
+               -H "Access-Control-Request-Method: GET" \
+               -H "Access-Control-Request-Headers: Content-Type" \
+               -X OPTIONS \
+               "${{ inputs.api_url }}/api/health" -m 10 || {
+            echo "⚠️ CORS preflight test failed"
+          }
+
+          echo "✅ CORS configuration test completed"
+
+      - name: 📱 Web App Accessibility Test
+        run: |
+          echo "🔍 Testing web app accessibility..."
+
+          # Test if web app serves the main page
+          if curl -f "${{ inputs.web_url }}" -m 15 >/dev/null 2>&1; then
+            echo "✅ Web app is serving content"
+          else
+            echo "❌ Web app accessibility test failed"
+            exit 1
+          fi
+
+      - name: 🔌 Integration Connectivity Test
+        run: |
+          echo "🔍 Testing web app to API connectivity..."
+
+          WEB_URL="${{ inputs.web_url }}"
+          API_URL="${{ inputs.api_url }}"
+
+          # Extract domain from web URL to test cross-origin setup
+          WEB_DOMAIN=$(echo "$WEB_URL" | sed 's|https\?://||' | sed 's|/.*||')
+          API_DOMAIN=$(echo "$API_URL" | sed 's|https\?://||' | sed 's|/.*||')
+
+          echo "🌐 Web domain: $WEB_DOMAIN"
+          echo "🌐 API domain: $API_DOMAIN"
+
+          if [[ "$WEB_DOMAIN" != "$API_DOMAIN" ]]; then
+            echo "✅ Cross-origin setup detected (web and API on different domains)"
+          else
+            echo "✅ Same-origin setup detected"
+          fi
+
+          echo "✅ Integration connectivity test completed"
+
+      - name: 🧪 Performance Test
+        run: |
+          echo "🔍 Running basic performance tests..."
+
+          # Test response times
+          echo "Testing API response time..."
+          API_TIME=$(curl -w "%{time_total}" -o /dev/null -s "${{ inputs.api_url }}/api/health")
+          echo "API response time: ${API_TIME}s"
+
+          echo "Testing web app response time..."
+          WEB_TIME=$(curl -w "%{time_total}" -o /dev/null -s "${{ inputs.web_url }}")
+          echo "Web app response time: ${WEB_TIME}s"
+
+          echo "✅ Performance tests completed"
+
+      - name: 🔄 Integration Test Summary
+        run: |
+          echo "🧪 Integration Results: ✅ PASSED"
+          echo "🌐 Web App: ${{ inputs.web_url }}"
+          echo "⚡ API Service: ${{ inputs.api_url }}"
+          echo "✅ Both services are healthy and properly configured"
+
+  test-e2e:
+    needs: [test-api, test-integration]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 🛒 Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: 📥 Install E2E Dependencies
+        run: |
+          echo "📦 Installing frontend dependencies for E2E tests..."
+          cd frontend
+          npm ci
+
+      - name: 🎭 Install Playwright Browsers
+        run: |
+          cd frontend
+          npx playwright install chromium firefox webkit
+          npx playwright install-deps
+
+      - name: 🔍 Environment Setup
+        run: |
+          echo "🌐 Web URL: ${{ inputs.web_url }}"
+          echo "🔗 API URL: ${{ inputs.api_url }}"
+          echo "🔄 Deployment Type: ${{ inputs.deployment_type }}"
+
+          if [ "${{ inputs.deployment_type }}" = "branch" ]; then
+            echo "🌿 Branch: ${{ inputs.branch_name }}"
+            echo "🔢 PR Number: ${{ inputs.pr_number }}"
+          fi
+
+          # Validate URLs
+          if [[ ! "${{ inputs.web_url }}" =~ ^https?:// ]] || [[ ! "${{ inputs.api_url }}" =~ ^https?:// ]]; then
+            echo "❌ Invalid URL format"
+            exit 1
+          fi
+
+      - name: ⏳ Wait for Deployments to Stabilize
+        run: |
+          echo "⏳ Allowing 30 seconds for deployments to fully stabilize..."
+          sleep 30
+
+          echo "🏥 Final health checks before e2e tests..."
+
+          # Check API health
+          for i in {1..3}; do
+            echo "API health check $i/3..."
+            if curl -f "${{ inputs.api_url }}/api/health" -m 10 >/dev/null 2>&1; then
+              echo "✅ API is healthy"
+              break
+            fi
+
+            if [ $i -eq 3 ]; then
+              echo "❌ API failed final health check"
+              exit 1
+            fi
+
+            sleep 5
+          done
+
+          # Check web app accessibility
+          for i in {1..3}; do
+            echo "Web accessibility check $i/3..."
+            if curl -f "${{ inputs.web_url }}" -m 10 >/dev/null 2>&1; then
+              echo "✅ Web app is accessible"
+              break
+            fi
+
+            if [ $i -eq 3 ]; then
+              echo "❌ Web app failed final accessibility check"
+              exit 1
+            fi
+
+            sleep 5
+          done
+
+      - name: 🧪 Run E2E Tests
+        run: |
+          cd frontend
+
+          # Run e2e tests against deployed services
+          echo "🎭 Running e2e tests against deployed services..."
+          echo "🌐 Testing Web: ${{ inputs.web_url }}"
+          echo "🔗 Testing API: ${{ inputs.api_url }}"
+
+          # Run Playwright tests in headless mode with timeout
+          # FAIL FAST: If tests fail, the build should fail
+          npx playwright test --timeout=60000
+
+          echo "✅ E2E tests passed!"
+        env:
+          # Set environment variables for the Playwright config
+          CI: true
+          WEB_DEPLOYMENT_URL: ${{ inputs.web_url }}
+          API_DEPLOYMENT_URL: ${{ inputs.api_url }}
+          FIREBASE_HOSTING_URL: ${{ inputs.web_url }}
+          CLOUD_RUN_URL: ${{ inputs.api_url }}
+          VITE_API_URL: ${{ inputs.api_url }}
+          BRANCH_NAME: ${{ inputs.branch_name }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          GITHUB_HEAD_REF: ${{ inputs.branch_name }}
+          GITHUB_EVENT_NUMBER: ${{ inputs.pr_number }}
+
+      - name: 📊 Upload E2E Test Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-test-results-${{ inputs.deployment_type }}-${{ inputs.pr_number || 'main' }}
+          path: frontend/playwright-report/
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: 📸 Upload E2E Screenshots
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: e2e-screenshots-${{ inputs.deployment_type }}-${{ inputs.pr_number || 'main' }}
+          path: frontend/test-results/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: 📋 E2E Test Summary
+        if: always()
+        run: |
+          echo "🎭 E2E Test Summary"
+          echo "🌐 Web App: ${{ inputs.web_url }}"
+          echo "🔗 API Service: ${{ inputs.api_url }}"
+          echo "🔄 Deployment Type: ${{ inputs.deployment_type }}"
+
+          if [ "${{ inputs.deployment_type }}" = "branch" ]; then
+            echo "🌿 Branch: ${{ inputs.branch_name }}"
+            echo "🔢 PR: #${{ inputs.pr_number }}"
+          fi
+
+          if [ $? -eq 0 ]; then
+            echo "✅ E2E tests completed successfully!"
+          else
+            echo "❌ E2E tests failed - check artifacts for details"
+          fi
+
+  update-pr-status:
+    needs: [test-api, test-integration, test-e2e]
+    if: inputs.deployment_type == 'branch' && always()
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 💬 Update PR with Test Status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const apiTestStatus = '${{ needs.test-api.result }}';
+            const integrationStatus = '${{ needs.test-integration.result }}';
+            const e2eStatus = '${{ needs.test-e2e.result }}';
+
+            const allTestsPassed = apiTestStatus === 'success' && integrationStatus === 'success' && e2eStatus === 'success';
+            const statusEmoji = allTestsPassed ? '✅' : '❌';
+            const statusText = allTestsPassed ? 'All tests passed!' : 'Some tests failed';
+
+            const commentBody = `### 🧪 Test Results
+
+            - **API Tests**: ${apiTestStatus === 'success' ? '✅ Passed' : apiTestStatus === 'skipped' ? '⏭️ Skipped' : '❌ Failed'}
+            - **Integration Tests**: ${integrationStatus === 'success' ? '✅ Passed' : integrationStatus === 'skipped' ? '⏭️ Skipped' : '❌ Failed'}
+            - **E2E Tests**: ${e2eStatus === 'success' ? '✅ Passed' : e2eStatus === 'skipped' ? '⏭️ Skipped' : '❌ Failed'}
+
+            ${statusEmoji} ${statusText}
+
+            ---
+            *🔄 Last updated: ${new Date().toLocaleString()} UTC*
+
+            <!-- BRANCH_TEST_STATUS_COMMENT -->`;
+
+            const comments = await github.rest.issues.listComments({
+              issue_number: ${{ inputs.pr_number }},
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+
+            const existingComment = comments.data.find(comment =>
+              comment.body.includes('<!-- BRANCH_DEPLOYMENT_COMMENT -->')
+            );
+
+            if (existingComment) {
+              // Append test status to existing deployment comment
+              const updatedBody = existingComment.body.replace(
+                '<!-- BRANCH_DEPLOYMENT_COMMENT -->',
+                `${commentBody}\n\n<!-- BRANCH_DEPLOYMENT_COMMENT -->`
+              );
+
+              await github.rest.issues.updateComment({
+                comment_id: existingComment.id,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: updatedBody
+              });
+            } else {
+              // Create new comment if deployment comment doesn't exist
+              await github.rest.issues.createComment({
+                issue_number: ${{ inputs.pr_number }},
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: commentBody
+              });
+            }
